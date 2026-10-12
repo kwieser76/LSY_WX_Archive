@@ -1,0 +1,59 @@
+# Saves every METAR, SPECI and TAF (incl. AMD, COR, RTD) of the airports in airports.json, every hour.
+# Copy to .github/workflows/wx-capture.yml in the public repository kwieser76/LSY_WX_Archive (branch main).
+# The script is scripts/capture-wx-reports.js (Node 20, no dependencies). MET Norway keeps 24 hours, so late
+# or skipped runs lose nothing. The archive (last 21 days, one gzip file per UTC day) lives on the branch
+# "data" as ONE orphan commit, force-pushed each run, so the repository does not grow with every run.
+name: WX report capture
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wx-capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Restore the archive from the data branch (none = start fresh)
+        run: |
+          mkdir -p "$RUNNER_TEMP/store"
+          if git fetch -q --depth=1 origin data 2>/dev/null; then
+            git --work-tree="$RUNNER_TEMP/store" checkout FETCH_HEAD -- archive 2>/dev/null || true
+            git reset -q
+          fi
+          ls -R "$RUNNER_TEMP/store" | head -40
+
+      - name: Capture METAR/TAF (appends only reports not stored yet, drops days older than 21)
+        run: WX_ARCHIVE_DIR="$RUNNER_TEMP/store/archive" node scripts/capture-wx-reports.js
+
+      - name: Publish the archive to the data branch (one orphan commit, force-pushed)
+        run: |
+          set -euo pipefail
+          [ -d "$RUNNER_TEMP/store/archive" ] || { echo "No archive yet - nothing to publish."; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -q --orphan data-publish
+          git rm -rq --cached . 2>/dev/null || true
+          rm -rf archive && cp -R "$RUNNER_TEMP/store/archive" archive
+          printf 'METAR/TAF archive, last 21 days. Data from MET Norway (CC BY 4.0). See the main branch.\n' > README.md
+          git add archive README.md
+          git commit -q -m "WX archive $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q --force origin HEAD:refs/heads/data
