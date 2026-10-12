@@ -57,3 +57,4 @@ jobs:
           git add archive README.md
           git commit -q -m "WX archive $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q --force origin HEAD:refs/heads/data
+# Plan B if MET Norway fails: api.weather.gov serves US stations only (METAR + TAF), no global coverage.
