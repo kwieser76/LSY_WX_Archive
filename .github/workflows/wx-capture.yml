@@ -12,12 +12,22 @@
 # are its busiest). MET Norway is still asked once an hour (the script decides from state.json lastMetNorwayTry); the
 # runs in between read the two whole-world cache files of the NOAA/NWS Aviation Weather Center (public domain) and
 # write the same day files plus archive/latest.json.gz. The concurrency group keeps runs from overlapping.
+# Gate (2026-10-13, v1.10.0): GitHub's schedule (:04, :14 …) and cron-job.org (:09, :19 …, tools/wx-archive/CRON-JOB-SETUP.md)
+# both start runs, 12 an hour. A run without "force" now ends at once, before any request to a source, when archive/state.json
+# on the data branch was checked less than 7 minutes ago: about 6 runs an hour whichever clock is working. When the check
+# cannot read state.json the run goes ahead (the archive feeds the Monday briefing; a gate must never stop it). By hand
+# with "force" ticked (gh workflow run wx-capture.yml -R kwieser76/LSY_WX_Archive -f force=true) a run always runs.
 name: WX report capture
 
 on:
   schedule:
     - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if the archive was updated less than 7 minutes ago (tick when starting by hand)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -31,6 +41,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - name: Run only when the archive was not updated in the last 7 minutes (by hand with force always; no answer = run)
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "Started by hand with force - runs."; exit 0; fi
+          at="$(gh api -H "Accept: application/vnd.github.raw" "repos/${{ github.repository }}/contents/archive/state.json?ref=data" 2>/dev/null | jq -r '.checkedAt // empty' 2>/dev/null || true)"
+          as="$(date -u -d "$at" +%s 2>/dev/null || echo 0)"; now=$(date -u +%s)
+          if [ -n "$at" ] && [ "$as" -gt 0 ] && [ $(( now - as )) -lt 420 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "Archive checked at $at, $(( (now - as) / 60 )) min ago - nothing to do (${{ github.event_name }})."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo "Archive last checked ${at:-unknown} - runs (${{ github.event_name }})."
+          fi
+
       - name: Check out main
         uses: actions/checkout@v4
         with:
@@ -53,11 +78,13 @@ jobs:
           fi
 
       - name: Set up Node 20
+        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Restore the archive from the data branch (no branch yet = start fresh; any other failure = stop)
+        if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/store"
@@ -78,9 +105,11 @@ jobs:
           ls -R "$RUNNER_TEMP/store" | head -40
 
       - name: Capture METAR/TAF (MET Norway hourly, AWC cache files in between; appends only reports not stored yet, drops days older than 21)
+        if: steps.gate.outputs.run == 'true'
         run: WX_ARCHIVE_DIR="$RUNNER_TEMP/store/archive" node scripts/capture-wx-reports.js
 
       - name: Publish the archive to the data branch (one orphan commit, force-pushed)
+        if: steps.gate.outputs.run == 'true'
         run: |
           set -euo pipefail
           [ -d "$RUNNER_TEMP/store/archive" ] || { echo "No archive yet - nothing to publish."; exit 0; }
@@ -97,6 +126,7 @@ jobs:
 
       # After the publish the work tree is the orphan data commit: back to main for the script.
       - name: Fail the run while a stop note is in force or a day file did not decode
+        if: steps.gate.outputs.run == 'true'
         run: |
           git switch -q main
           WX_ARCHIVE_DIR="$RUNNER_TEMP/store/archive" node scripts/capture-wx-reports.js --check
