@@ -91,6 +91,9 @@ jobs:
           git commit -q -m "WX archive $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q --force origin HEAD:refs/heads/data
 
+      # After the publish the work tree is the orphan data commit: back to main for the script.
       - name: Fail the run while a stop note is in force or a day file did not decode
-        run: WX_ARCHIVE_DIR="$RUNNER_TEMP/store/archive" node scripts/capture-wx-reports.js --check
+        run: |
+          git switch -q main
+          WX_ARCHIVE_DIR="$RUNNER_TEMP/store/archive" node scripts/capture-wx-reports.js --check
 # Plan B if MET Norway fails: api.weather.gov serves US stations only (METAR + TAF), no global coverage.
