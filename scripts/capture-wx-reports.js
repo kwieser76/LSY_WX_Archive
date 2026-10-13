@@ -119,7 +119,9 @@ const marksOf = (s, extra) => {
 // One report → { icao, kind, marks, time, raw, src }, or null for anything else (blank line, NIL, a line that does not
 // start with a known airport). MET Norway (src 'metno', one line of the extended answer): the markers in front are its
 // own, so the raw text is kept as served without them and the markers travel beside it (as since 2026-10-12). AWC (src
-// 'awc', the raw_text of one row): the raw text is kept exactly as served, keywords included. hint (AWC): { kind } from
+// 'awc', the raw_text of one row): stored in the same form, without the leading keywords (METAR, SPECI, TAF, AMD, COR),
+// which travel as kind and marks; every reader of the archive (the page, the Monday run) expects the airport code
+// first (2026-10-13: 723 AWC lines were first stored with "METAR"/"TAF" in front). hint (AWC): { kind } from
 // metar_type, for a SPECI whose raw text does not say so, and { marks } from the row's corrected column or the TAF's
 // remarks ("AMD"/"COR"), which AWC fills where the raw text has no keyword (2026-10-13: 142 TAF AMD, 6 TAF COR).
 function parseLine(line, nowIso, wanted, src, hint) {
@@ -131,7 +133,7 @@ function parseLine(line, nowIso, wanted, src, hint) {
   if (!time) return null;
   const isTaf = s.lead.indexOf('TAF') >= 0 || /^\d{4}\/\d{4}$/.test(s.rest[0]);
   const kind = isTaf ? 'TAF' : (s.lead.indexOf('SPECI') >= 0 || (hint && hint.kind === 'SPECI') ? 'SPECI' : 'METAR');
-  const raw = src === 'awc' ? String(line).trim().replace(/\s+/g, ' ') : s.toks.join(' ');
+  const raw = s.toks.join(' ');
   return { icao: s.icao, kind, marks: marksOf(s, (hint && hint.marks) || []), time, raw, src: src === 'awc' ? 'awc' : 'metno' };
 }
 // The one dedupe key of the archive, for both sources and for lines stored before 2026-10-13: ICAO + kind + report time
@@ -340,6 +342,18 @@ function readDayText(file) {
   try { buf = fs.readFileSync(file); } catch (e) { if (e.code === 'ENOENT') return ''; return null; }
   try { return zlib.gunzipSync(buf).toString('utf8'); } catch (e) { return null; }
 }
+// A stored day file with AWC lines from before the rule above (keywords in front): the same lines in the stored form.
+// Applied when a day file is read, so the next write of that day corrects it; other lines are left byte for byte.
+function normDayText(text) {
+  if (text == null || !/"src":"awc"/.test(text)) return text;
+  return String(text).split('\n').map(l => {
+    if (!l.trim()) return l;
+    let r; try { r = JSON.parse(l); } catch (e) { return l; }
+    const sp = r && r.src === 'awc' ? splitReport(r.raw) : null;
+    if (!sp || !sp.lead.length) return l;
+    return JSON.stringify(Object.assign({}, r, { raw: sp.toks.join(' '), marks: marksOf(sp, r.marks || []) }));
+  }).join('\n');
+}
 function linesOf(text) {
   const out = [];
   String(text || '').split('\n').forEach(l => { if (l.trim()) { try { out.push(JSON.parse(l)); } catch (e) { /* a damaged line is skipped */ } } });
@@ -473,14 +487,14 @@ async function main() {
   const texts = {}, stored = new Set(), undecodable = [];
   for (let back = 0; back < 3; back++) {
     const p = dayOf(new Date(Date.parse(nowIso) - back * 86400000).toISOString()), rel = p.dir + '/' + p.file;
-    texts[rel] = readDayText(path.join(ROOT, rel));
+    texts[rel] = normDayText(readDayText(path.join(ROOT, rel)));
     if (texts[rel] == null) { undecodable.push(rel); continue; }
     keysOfText(texts[rel]).forEach(k => stored.add(k));
   }
   const pl = plan(got.input, nowIso, wanted, stored, got.src);
   let added = 0, touched = 0;
   Object.keys(pl.add).sort().forEach(rel => {
-    const file = path.join(ROOT, rel), before = rel in texts ? texts[rel] : readDayText(file);
+    const file = path.join(ROOT, rel), before = rel in texts ? texts[rel] : normDayText(readDayText(file));
     if (before == null) {
       if (undecodable.indexOf(rel) < 0) undecodable.push(rel);
       warn(rel + ' exists but does not decode — kept as it is, ' + pl.add[rel].length + ' new report(s) for that day not stored.');
@@ -530,7 +544,7 @@ function verifyPublish(listFile, dir) {
   return P.length ? 1 : 0;
 }
 
-module.exports = { URL, AWC_METARS, AWC_TAFS, UA, KEEP_DAYS, BLOCK_HOURS, BATCH, METNO_EVERY_MIN, LATEST_METARS, resolveTime, splitReport, parseLine, keyOf, crossKeyOf, storedKeysOf, dayOf, plan,
+module.exports = { normDayText, URL, AWC_METARS, AWC_TAFS, UA, KEEP_DAYS, BLOCK_HOURS, BATCH, METNO_EVERY_MIN, LATEST_METARS, resolveTime, splitReport, parseLine, keyOf, crossKeyOf, storedKeysOf, dayOf, plan,
   csvRows, parseAwcMetars, parseAwcTafs, metNorwayDue, tafValidity, tafsInForce, latestOf, expired, publishProblems, activeBlocks, blockEntry, readDayText, listDayFiles };
 if (require.main === module) {
   const a = process.argv.slice(2);
