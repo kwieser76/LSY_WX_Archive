@@ -39,9 +39,10 @@
 //   archive/state.json            { checkedAt, source, lastMetNorway, lastMetNorwayTry, lastAwc, lines, added, missing, ... }
 //   archive/blocked.json          the stop note: { blocked: [{ host, status, at, until, path }] } after HTTP 403/429
 // Day files older than KEEP_DAYS are dropped: the weekly reader takes its week each Monday.
-// A report is stored once: the key (keyOf) is ICAO + kind + report time + marks + the report body without its keywords,
-// the same for both sources (MET Norway moves AUTO, COR, SPECI and AMD out of the body as markers; AWC keeps
-// "METAR/SPECI/TAF AMD/COR" in front and AUTO/COR after the time). `raw` stays as the source served it. `seen` is when
+// A report is stored once, by one rule for both sources: the key (keyOf) is ICAO + kind + report time + marks + the report
+// body without its keywords (MET Norway moves AUTO, COR, SPECI and AMD out of the body as markers; AWC keeps
+// "METAR/SPECI/TAF AMD/COR" in front and AUTO/COR after the time), and across the sources ICAO + kind + report time + COR
+// or not (crossKeyOf: MET Norway changes markers and text, measured). `raw` stays as the source served it. `seen` is when
 // this capture first saw it. A transient error is a GitHub warning and the job still ends with exit 0, so one bad run
 // never turns the workflow red; a gap shows up in the weekly report as a gap.
 // Review 2026-10-13, three things DO turn it red (the workflow's last step, --check), after the publish:
@@ -118,9 +119,10 @@ const marksOf = (s, extra) => {
 // One report → { icao, kind, marks, time, raw, src }, or null for anything else (blank line, NIL, a line that does not
 // start with a known airport). MET Norway (src 'metno', one line of the extended answer): the markers in front are its
 // own, so the raw text is kept as served without them and the markers travel beside it (as since 2026-10-12). AWC (src
-// 'awc', the raw_text of one row): the raw text is kept exactly as served, keywords included. kindHint: AWC's
-// metar_type, for a SPECI whose raw text does not say so.
-function parseLine(line, nowIso, wanted, src, kindHint) {
+// 'awc', the raw_text of one row): the raw text is kept exactly as served, keywords included. hint (AWC): { kind } from
+// metar_type, for a SPECI whose raw text does not say so, and { marks } from the row's corrected column or the TAF's
+// remarks ("AMD"/"COR"), which AWC fills where the raw text has no keyword (2026-10-13: 142 TAF AMD, 6 TAF COR).
+function parseLine(line, nowIso, wanted, src, hint) {
   const s = splitReport(line);
   if (!s) return null;
   if (wanted && !wanted.has(s.icao)) return null;
@@ -128,9 +130,9 @@ function parseLine(line, nowIso, wanted, src, kindHint) {
   const time = resolveTime(s.ddhhmm, nowIso);
   if (!time) return null;
   const isTaf = s.lead.indexOf('TAF') >= 0 || /^\d{4}\/\d{4}$/.test(s.rest[0]);
-  const kind = isTaf ? 'TAF' : (s.lead.indexOf('SPECI') >= 0 || kindHint === 'SPECI' ? 'SPECI' : 'METAR');
+  const kind = isTaf ? 'TAF' : (s.lead.indexOf('SPECI') >= 0 || (hint && hint.kind === 'SPECI') ? 'SPECI' : 'METAR');
   const raw = src === 'awc' ? String(line).trim().replace(/\s+/g, ' ') : s.toks.join(' ');
-  return { icao: s.icao, kind, marks: marksOf(s), time, raw, src: src === 'awc' ? 'awc' : 'metno' };
+  return { icao: s.icao, kind, marks: marksOf(s, (hint && hint.marks) || []), time, raw, src: src === 'awc' ? 'awc' : 'metno' };
 }
 // The one dedupe key of the archive, for both sources and for lines stored before 2026-10-13: ICAO + kind + report time
 // + marks (the stored ones and the ones the raw text carries) + the body without its keywords and markers, without AUTO,
@@ -144,29 +146,45 @@ function keyOf(r) {
   if (t.length) { t[t.length - 1] = t[t.length - 1].replace(/=+$/, ''); if (!t[t.length - 1]) t.pop(); }
   return [r && r.icao, r && r.kind, r && r.time, marks.join('+'), t.map(x => (x === '?' ? '$' : x)).join(' ')].join('|');
 }
+// The second half of the rule, across the sources only: the same ICAO, kind and report time, both a COR or both not =
+// the same report, whatever the text. Measured on the first AWC run (2026-10-13 09:30Z): of 168 AWC reports, 135 were
+// already stored from MET Norway and keyOf matched none of them. MET Norway changes markers and text: it marks delayed
+// reports RTD (AWC never), sets AMD/COR where AWC's text has none and the other way round, and in 32 of the 135 the text
+// differs too (the RMK section of Turkish METARs and the A-group after Q in Iranian and Emirati ones dropped, "AMD" taken
+// out of "AMD NOT SKED", TAFs cut short, "18010G 20KT"). A station sends one report per time; a correction is a COR.
+const crossKeyOf = r => [r && r.icao, r && r.kind, r && r.time, marksOf(splitReport(r && r.raw), (r && r.marks) || []).indexOf('COR') >= 0 ? 'COR' : ''].join('|');
+// What plan() compares against: keyOf of every stored line, and crossKeyOf per source ('X|<src>|...').
+function storedKeysOf(lines) {
+  const keys = new Set();
+  (lines || []).forEach(r => { if (r) { keys.add(keyOf(r)); keys.add('X|' + (r.src || 'metno') + '|' + crossKeyOf(r)); } });
+  return keys;
+}
+const SOURCES = ['metno', 'awc'];
 const dayOf = time => ({ dir: time.slice(0, 4) + '/' + time.slice(5, 7), file: time.slice(8, 10) + '.ndjson.gz' });
 
-// Which reports are new, given the keys already stored. input: MET Norway's answer (text, one report per line) or a
-// list of AWC reports ({ raw, kind }). Returns the reports to append, grouped by day file, and the airports read.
+// Which reports are new, given the keys already stored (storedKeysOf; a plain set of keyOf keys works too). input: MET
+// Norway's answer (text, one report per line) or a list of AWC reports ({ raw, kind, marks }). A report is not new when its
+// keyOf is stored, or its crossKeyOf is stored for the other source. Returns the reports to append, grouped by day
+// file, and the airports read.
 function plan(input, nowIso, wanted, storedKeys, src) {
   const add = {}, seen = new Set(), icaos = new Set();
   let parsed = 0;
   const items = typeof input === 'string' || input == null ? String(input || '').split(/\r?\n/) : input;
   items.forEach(it => {
-    const r = typeof it === 'string' ? parseLine(it, nowIso, wanted, src) : parseLine(it && it.raw, nowIso, wanted, src, it && it.kind);
+    const r = typeof it === 'string' ? parseLine(it, nowIso, wanted, src) : parseLine(it && it.raw, nowIso, wanted, src, it);
     if (!r) return;
     parsed++;
     icaos.add(r.icao);
-    const k = keyOf(r);
-    if (seen.has(k) || (storedKeys && storedKeys.has(k))) return;
+    const k = keyOf(r), ck = crossKeyOf(r);
+    if (seen.has(k) || (storedKeys && (storedKeys.has(k) || SOURCES.some(o => o !== r.src && storedKeys.has('X|' + o + '|' + ck))))) return;
     seen.add(k);
     const p = dayOf(r.time), rel = p.dir + '/' + p.file;
     (add[rel] = add[rel] || []).push({ icao: r.icao, kind: r.kind, marks: r.marks, time: r.time, raw: r.raw, seen: nowIso.slice(0, 16) + 'Z', src: r.src });
   });
   return { parsed, add, icaos };
 }
-// AWC metars.cache.csv (RFC 4180, a header row with raw_text, station_id, observation_time, ..., metar_type) → [{ raw, kind }]
-// of the wanted stations. flight_category and the decoded columns are not used.
+// AWC metars.cache.csv (RFC 4180, a header row with raw_text, station_id, observation_time, ..., corrected, ..., metar_type)
+// → [{ raw, kind, marks }] of the wanted stations. flight_category and the decoded columns are not used.
 function csvRows(text) {
   const rows = [];
   let row = [], f = '', q = false;
@@ -184,21 +202,22 @@ function csvRows(text) {
 function parseAwcMetars(text, wanted) {
   const rows = csvRows(String(text || '')), h = rows.findIndex(r => r.indexOf('raw_text') >= 0 && r.indexOf('station_id') >= 0);
   if (h < 0) return [];
-  const iRaw = rows[h].indexOf('raw_text'), iSt = rows[h].indexOf('station_id'), iType = rows[h].indexOf('metar_type'), out = [];
+  const iRaw = rows[h].indexOf('raw_text'), iSt = rows[h].indexOf('station_id'), iType = rows[h].indexOf('metar_type'), iCor = rows[h].indexOf('corrected'), out = [];
   rows.slice(h + 1).forEach(r => {
     const raw = (r[iRaw] || '').trim(), st = (r[iSt] || '').trim();
     if (!raw || (wanted && !wanted.has(st))) return;
-    out.push({ raw, kind: iType >= 0 && r[iType] === 'SPECI' ? 'SPECI' : 'METAR' });
+    out.push({ raw, kind: iType >= 0 && r[iType] === 'SPECI' ? 'SPECI' : 'METAR', marks: iCor >= 0 && /^true$/i.test(r[iCor] || '') ? ['COR'] : [] });
   });
   return out;
 }
-// AWC tafs.cache.xml (<TAF><raw_text><![CDATA[TAF AMD ...]]></raw_text><station_id>...</station_id>...</TAF>) → [{ raw, kind: 'TAF' }].
+// AWC tafs.cache.xml (<TAF><raw_text><![CDATA[TAF AMD ...]]></raw_text><station_id>...</station_id>...<remarks>AMD</remarks>...</TAF>)
+// → [{ raw, kind: 'TAF', marks }].
 function parseAwcTafs(text, wanted) {
   const val = (b, tag) => { const m = new RegExp('<' + tag + '>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*))</' + tag + '>').exec(b); return m ? (m[1] != null ? m[1] : m[2].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')).trim() : ''; };
   const out = [];
   (String(text || '').match(/<TAF>[\s\S]*?<\/TAF>/g) || []).forEach(b => {
-    const raw = val(b, 'raw_text'), st = val(b, 'station_id');
-    if (raw && (!wanted || wanted.has(st))) out.push({ raw, kind: 'TAF' });
+    const raw = val(b, 'raw_text'), st = val(b, 'station_id'), rm = val(b, 'remarks');
+    if (raw && (!wanted || wanted.has(st))) out.push({ raw, kind: 'TAF', marks: rm === 'AMD' || rm === 'COR' ? [rm] : [] });
   });
   return out;
 }
@@ -260,17 +279,26 @@ function latestOf(records, icaos, atIso, source) {
   const ap = {}, missing = [];
   (icaos || []).forEach(icao => {
     const rs = (by[icao] || []).filter(r => ms(r.time) <= at + 600000);
-    const one = {};
-    rs.filter(r => r.kind !== 'TAF').forEach(r => {
-      const o = one[r.time], cor = (r.marks || []).indexOf('COR') >= 0;
-      if (!o || (cor && (o.marks || []).indexOf('COR') < 0) || (cor === ((o.marks || []).indexOf('COR') >= 0) && String(r.seen || '') > String(o.seen || ''))) one[r.time] = r;
-    });
+    // one METAR/SPECI per report time: the COR, else AWC's text (MET Norway shortens some, see crossKeyOf), else the newest seen
+    const one = {}, rank = r => [(r.marks || []).indexOf('COR') >= 0 ? 1 : 0, r.src === 'awc' ? 1 : 0, String(r.seen || '')];
+    const better = (a, b) => { const x = rank(a), y = rank(b); return x[0] !== y[0] ? x[0] > y[0] : x[1] !== y[1] ? x[1] > y[1] : x[2] > y[2]; };
+    rs.filter(r => r.kind !== 'TAF').forEach(r => { if (!one[r.time] || better(r, one[r.time])) one[r.time] = r; });
     const m = Object.keys(one).sort().slice(-LATEST_METARS).map(t => { const r = one[t]; return [r.time, r.kind, (r.marks || []).join('+'), r.raw, r.src || 'metno']; });
-    const tafs = rs.filter(r => r.kind === 'TAF').map(r => {
+    const tafs0 = rs.filter(r => r.kind === 'TAF').map(r => {
       const val = tafValidity(r.raw, r.time), s = splitReport(r.raw);
       return { r, val, ms: ms(r.time), v: val && { a: ms(val.from), b: ms(val.to) }, fix: (r.marks || []).some(x => x === 'AMD' || x === 'COR'),
         cnl: !!(s && s.rest.some(x => /^CNL=?$/.test(x))) };
-    }).sort((a, b) => a.ms - b.ms);
+    });
+    // one TAF per issue time, COR or not, and validity: the same report stored twice (from both sources before crossKeyOf,
+    // or from MET Norway once plain and once RTD) shows once, in AWC's text, else the one marked AMD/COR, else the newest seen
+    const tb = {}, trank = x => [x.r.src === 'awc' ? 1 : 0, x.fix ? 1 : 0, String(x.r.seen || '')];
+    tafs0.forEach(x => {
+      const k = crossKeyOf(x.r) + '|' + (x.val ? x.val.from + x.val.to : x.r.raw), o = tb[k];
+      if (!o) { tb[k] = x; return; }
+      const p = trank(x), q = trank(o);
+      if (p[0] !== q[0] ? p[0] > q[0] : p[1] !== q[1] ? p[1] > q[1] : p[2] > q[2]) tb[k] = x;
+    });
+    const tafs = Object.keys(tb).map(k => tb[k]).sort((a, b) => a.ms - b.ms);
     const t = tafsInForce(tafs, at).map(x => [x.r.time, (x.r.marks || []).join('+'), x.r.raw, x.r.src || 'metno', x.val.from, x.val.to]);
     if (!m.length && !t.length) { missing.push(icao); return; }
     ap[icao] = { m, t };
@@ -317,7 +345,7 @@ function linesOf(text) {
   String(text || '').split('\n').forEach(l => { if (l.trim()) { try { out.push(JSON.parse(l)); } catch (e) { /* a damaged line is skipped */ } } });
   return out;
 }
-const keysOfText = text => new Set(linesOf(text).map(keyOf));
+const keysOfText = text => storedKeysOf(linesOf(text));
 function listDayFiles(root) {
   const out = [];
   try {
@@ -502,7 +530,7 @@ function verifyPublish(listFile, dir) {
   return P.length ? 1 : 0;
 }
 
-module.exports = { URL, AWC_METARS, AWC_TAFS, UA, KEEP_DAYS, BLOCK_HOURS, BATCH, METNO_EVERY_MIN, LATEST_METARS, resolveTime, splitReport, parseLine, keyOf, dayOf, plan,
+module.exports = { URL, AWC_METARS, AWC_TAFS, UA, KEEP_DAYS, BLOCK_HOURS, BATCH, METNO_EVERY_MIN, LATEST_METARS, resolveTime, splitReport, parseLine, keyOf, crossKeyOf, storedKeysOf, dayOf, plan,
   csvRows, parseAwcMetars, parseAwcTafs, metNorwayDue, tafValidity, tafsInForce, latestOf, expired, publishProblems, activeBlocks, blockEntry, readDayText, listDayFiles };
 if (require.main === module) {
   const a = process.argv.slice(2);
