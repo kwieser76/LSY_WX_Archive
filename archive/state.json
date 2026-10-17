@@ -1,0 +1,22 @@
+{
+ "checkedAt": "2026-10-17T16:29:23.202Z",
+ "source": "metno",
+ "sourceName": "MET Norway tafmetar",
+ "lastMetNorway": "2026-10-17T16:29:23.202Z",
+ "lastMetNorwayTry": "2026-10-17T16:29:23.202Z",
+ "lastAwc": "2026-10-17T16:19:23.301Z",
+ "lastModified": "Sat, 17 Oct 2026 16:29:43 GMT",
+ "downloadBytes": 1714417,
+ "airports": 533,
+ "lines": 22861,
+ "added": 30,
+ "missing": 6,
+ "failedBatches": [],
+ "dropped": [],
+ "undecodable": [],
+ "latest": {
+  "generatedAt": "2026-10-17T16:29:44.157Z",
+  "bytes": 49919,
+  "airports": 532
+ }
+}
