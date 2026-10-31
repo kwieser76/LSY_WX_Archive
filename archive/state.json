@@ -1,0 +1,22 @@
+{
+ "checkedAt": "2026-10-31T22:09:23.416Z",
+ "source": "awc",
+ "sourceName": "NOAA/NWS Aviation Weather Center cache files",
+ "lastMetNorway": "2026-10-31T21:29:21.501Z",
+ "lastMetNorwayTry": "2026-10-31T21:29:21.501Z",
+ "lastAwc": "2026-10-31T22:09:23.416Z",
+ "lastModified": null,
+ "downloadBytes": 591503,
+ "airports": 533,
+ "lines": 1040,
+ "added": 282,
+ "missing": 5,
+ "failedBatches": [],
+ "dropped": [],
+ "undecodable": [],
+ "latest": {
+  "generatedAt": "2026-10-31T22:09:24.249Z",
+  "bytes": 50367,
+  "airports": 532
+ }
+}
